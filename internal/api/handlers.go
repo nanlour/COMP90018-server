@@ -1,0 +1,404 @@
+package api
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"github.com/rongwang/COMP90018-server/internal/models"
+	"github.com/rongwang/COMP90018-server/internal/service"
+)
+
+// Handler handles HTTP requests
+type Handler struct {
+	service service.Service
+}
+
+// NewHandler creates a new Handler
+func NewHandler(service service.Service) *Handler {
+	return &Handler{
+		service: service,
+	}
+}
+
+// SetupRoutes sets up all the routes for the API
+func (h *Handler) SetupRoutes(r *gin.Engine) {
+	// Group for authentication endpoints
+	auth := r.Group("/api/auth")
+	{
+		auth.POST("/signup", h.SignUp)
+		auth.POST("/login", h.Login)
+	}
+
+	// Group for ledger endpoints (requires authentication)
+	ledgers := r.Group("/api/ledgers")
+	ledgers.Use(AuthMiddleware())
+	{
+		ledgers.POST("", h.CreateLedger)
+		ledgers.DELETE("/:ledgerId", h.DeleteLedger)
+		ledgers.POST("/:ledgerId/changes", h.SubmitLedgerChange)
+		ledgers.GET("/:ledgerId/changes", h.GetLedgerChanges)
+		ledgers.GET("/:ledgerId/sequence", h.GetLatestSequenceNumber)
+		ledgers.POST("/:ledgerId/users", h.AddUserToLedger)
+	}
+}
+
+// Authentication handlers
+func (h *Handler) SignUp(c *gin.Context) {
+	var req models.SignUpRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Invalid request parameters",
+		})
+		return
+	}
+
+	res, err := h.service.SignUp(c.Request.Context(), req)
+	if err != nil {
+		if err.Error() == "user with this email already exists" {
+			c.JSON(http.StatusConflict, models.ErrorResponse{
+				Status:  "error",
+				Code:    "CONFLICT",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to create user",
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, res)
+}
+
+func (h *Handler) Login(c *gin.Context) {
+	var req models.LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Invalid request parameters",
+		})
+		return
+	}
+
+	res, err := h.service.Login(c.Request.Context(), req)
+	if err != nil {
+		if err.Error() == "invalid email or password" {
+			c.JSON(http.StatusUnauthorized, models.ErrorResponse{
+				Status:  "error",
+				Code:    "UNAUTHORIZED",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to login",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, res)
+}
+
+// Ledger handlers
+func (h *Handler) CreateLedger(c *gin.Context) {
+	var req models.CreateLedgerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Invalid request parameters",
+		})
+		return
+	}
+
+	// Get user ID from context (set by auth middleware)
+	userID := c.GetString("userId")
+
+	res, err := h.service.CreateLedger(c.Request.Context(), userID, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to create ledger",
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, res)
+}
+
+func (h *Handler) DeleteLedger(c *gin.Context) {
+	ledgerID := c.Param("ledgerId")
+	if ledgerID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Ledger ID is required",
+		})
+		return
+	}
+
+	// Get user ID from context (set by auth middleware)
+	userID := c.GetString("userId")
+
+	if err := h.service.DeleteLedger(c.Request.Context(), userID, ledgerID); err != nil {
+		if err.Error() == "ledger not found" {
+			c.JSON(http.StatusNotFound, models.ErrorResponse{
+				Status:  "error",
+				Code:    "NOT_FOUND",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		if err.Error() == "you don't have permission to delete this ledger" {
+			c.JSON(http.StatusForbidden, models.ErrorResponse{
+				Status:  "error",
+				Code:    "FORBIDDEN",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to delete ledger",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "Ledger deleted successfully",
+	})
+}
+
+func (h *Handler) SubmitLedgerChange(c *gin.Context) {
+	ledgerID := c.Param("ledgerId")
+	if ledgerID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Ledger ID is required",
+		})
+		return
+	}
+
+	var req models.LedgerChangeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Invalid request parameters",
+		})
+		return
+	}
+
+	// Get user ID from context (set by auth middleware)
+	userID := c.GetString("userId")
+
+	res, err := h.service.SubmitLedgerChange(c.Request.Context(), userID, ledgerID, req)
+	if err != nil {
+		if err.Error() == "you don't have write permission for this ledger" {
+			c.JSON(http.StatusForbidden, models.ErrorResponse{
+				Status:  "error",
+				Code:    "FORBIDDEN",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		if err.Error() == "sequence number conflict" {
+			c.JSON(http.StatusConflict, models.ErrorResponse{
+				Status:  "error",
+				Code:    "CONFLICT",
+				Message: "Sequence number conflict. Please fetch latest changes and retry.",
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to submit ledger change",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, res)
+}
+
+func (h *Handler) GetLedgerChanges(c *gin.Context) {
+	ledgerID := c.Param("ledgerId")
+	if ledgerID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Ledger ID is required",
+		})
+		return
+	}
+
+	// Get sequence range from query parameters
+	fromSeqStr := c.Query("fromSequence")
+	if fromSeqStr == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "fromSequence parameter is required",
+		})
+		return
+	}
+
+	fromSeq, err := strconv.ParseInt(fromSeqStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Invalid fromSequence parameter",
+		})
+		return
+	}
+
+	// toSequence is optional
+	var toSeq int64 = 0
+	toSeqStr := c.Query("toSequence")
+	if toSeqStr != "" {
+		toSeq, err = strconv.ParseInt(toSeqStr, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.ErrorResponse{
+				Status:  "error",
+				Code:    "BAD_REQUEST",
+				Message: "Invalid toSequence parameter",
+			})
+			return
+		}
+	}
+
+	// Get user ID from context (set by auth middleware)
+	userID := c.GetString("userId")
+
+	res, err := h.service.GetLedgerChanges(c.Request.Context(), userID, ledgerID, fromSeq, toSeq)
+	if err != nil {
+		if err.Error() == "you don't have access to this ledger" {
+			c.JSON(http.StatusForbidden, models.ErrorResponse{
+				Status:  "error",
+				Code:    "FORBIDDEN",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to get ledger changes",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, res)
+}
+
+func (h *Handler) AddUserToLedger(c *gin.Context) {
+	ledgerID := c.Param("ledgerId")
+	if ledgerID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Ledger ID is required",
+		})
+		return
+	}
+
+	var req models.AddUserToLedgerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Invalid request parameters",
+		})
+		return
+	}
+
+	// Get user ID from context (set by auth middleware)
+	userID := c.GetString("userId")
+
+	res, err := h.service.AddUserToLedger(c.Request.Context(), userID, ledgerID, req)
+	if err != nil {
+		if err.Error() == "you don't have permission to add users to this ledger" {
+			c.JSON(http.StatusForbidden, models.ErrorResponse{
+				Status:  "error",
+				Code:    "FORBIDDEN",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		if err.Error() == "user not found" {
+			c.JSON(http.StatusNotFound, models.ErrorResponse{
+				Status:  "error",
+				Code:    "NOT_FOUND",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to add user to ledger",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, res)
+}
+
+func (h *Handler) GetLatestSequenceNumber(c *gin.Context) {
+	ledgerID := c.Param("ledgerId")
+	if ledgerID == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{
+			Status:  "error",
+			Code:    "BAD_REQUEST",
+			Message: "Ledger ID is required",
+		})
+		return
+	}
+
+	// Get user ID from context (set by auth middleware)
+	userID := c.GetString("userId")
+
+	res, err := h.service.GetLatestSequenceNumber(c.Request.Context(), userID, ledgerID)
+	if err != nil {
+		if err.Error() == "you don't have access to this ledger" {
+			c.JSON(http.StatusForbidden, models.ErrorResponse{
+				Status:  "error",
+				Code:    "FORBIDDEN",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Status:  "error",
+			Code:    "INTERNAL_ERROR",
+			Message: "Failed to get latest sequence number",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, res)
+}

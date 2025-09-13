@@ -1,0 +1,42 @@
+--- a/internal/api/handlers.go
++++ b/internal/api/handlers.go
+@@ -367,3 +367,30 @@ func (h *Handler) AddUserToLedger(c *gin.Context) {
+ 
+ c.JSON(http.StatusOK, res)
+ }
++
++func (h *Handler) GetLatestSequenceNumber(c *gin.Context) {
++ledgerID := c.Param("ledgerId")
++if ledgerID == "" {
++c.JSON(http.StatusBadRequest, models.ErrorResponse{
++Status:  "error",
++Code:    "BAD_REQUEST",
++Message: "Ledger ID is required",
++})
++return
++}
++
++// Get user ID from context (set by auth middleware)
++userID := c.GetString("userId")
++
++res, err := h.service.GetLatestSequenceNumber(c.Request.Context(), userID, ledgerID)
++if err != nil {
++if err.Error() == "you don't have access to this ledger" {
++c.JSON(http.StatusForbidden, models.ErrorResponse{
++Status:  "error",
++Code:    "FORBIDDEN",
++Message: err.Error(),
++})
++return
++}
++
++c.JSON(http.StatusInternalServerError, models.ErrorResponse{
++Status:  "error",
++Code:    "INTERNAL_ERROR",
++Message: "Failed to get latest sequence number",
++})
++return
++}
++
++c.JSON(http.StatusOK, res)
++}
