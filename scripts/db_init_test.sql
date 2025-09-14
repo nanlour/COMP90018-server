@@ -40,6 +40,26 @@ CREATE TABLE IF NOT EXISTS ledger_changes (
     UNIQUE (ledger_id, sequence_number)
 );
 
+-- Create ledger_sequences table to track sequence numbers
+CREATE TABLE IF NOT EXISTS ledger_sequences (
+    ledger_id VARCHAR(36) PRIMARY KEY REFERENCES ledgers(id) ON DELETE CASCADE,
+    current_sequence BIGINT NOT NULL DEFAULT 0
+);
+
+-- Create a trigger to initialize sequence when a new ledger is created
+CREATE OR REPLACE FUNCTION init_ledger_sequence()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO ledger_sequences (ledger_id, current_sequence) VALUES (NEW.id, 0);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER create_ledger_sequence
+    AFTER INSERT ON ledgers
+    FOR EACH ROW
+    EXECUTE FUNCTION init_ledger_sequence();
+
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_ledger_changes_ledger_id ON ledger_changes(ledger_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_changes_ledger_seq ON ledger_changes(ledger_id, sequence_number);

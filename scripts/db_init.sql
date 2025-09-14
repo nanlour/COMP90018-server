@@ -1,10 +1,10 @@
--- Create database if it doesn't exist
-CREATE DATABASE IF NOT EXISTS billapp;
+-- Drop database if exists (comment out in production)
+DROP DATABASE IF EXISTS billapp;
 
--- Connect to the database
-\c billapp;
+-- Create database
+CREATE DATABASE billapp;
 
--- Create users table
+-- The rest of the schema creation needs to be in a separate file
 CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(36) PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -45,6 +45,26 @@ CREATE TABLE IF NOT EXISTS ledger_changes (
     base_sequence_number BIGINT NOT NULL,
     UNIQUE (ledger_id, sequence_number)
 );
+
+-- Create ledger_sequences table to track sequence numbers
+CREATE TABLE IF NOT EXISTS ledger_sequences (
+    ledger_id VARCHAR(36) PRIMARY KEY REFERENCES ledgers(id) ON DELETE CASCADE,
+    current_sequence BIGINT NOT NULL DEFAULT 0
+);
+
+-- Create a trigger to initialize sequence when a new ledger is created
+CREATE OR REPLACE FUNCTION init_ledger_sequence()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO ledger_sequences (ledger_id, current_sequence) VALUES (NEW.id, 0);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER create_ledger_sequence
+    AFTER INSERT ON ledgers
+    FOR EACH ROW
+    EXECUTE FUNCTION init_ledger_sequence();
 
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_ledger_changes_ledger_id ON ledger_changes(ledger_id);

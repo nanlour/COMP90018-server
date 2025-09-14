@@ -185,13 +185,14 @@ func (s *DefaultService) SubmitLedgerChange(
 		return nil, errors.New("you don't have write permission for this ledger")
 	}
 
-	// Get the latest sequence number
+	// Get the latest sequence number for the base
 	latestSeq, err := s.repo.GetLatestSequenceNumber(ctx, ledgerID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting latest sequence number: %w", err)
 	}
 
-	// Create the ledger change
+	// Create the ledger change with base sequence number, but let the repository
+	// handle the sequence number assignment within a transaction
 	change := &models.LedgerChange{
 		ID:              uuid.New().String(),
 		LedgerID:        ledgerID,
@@ -199,10 +200,10 @@ func (s *DefaultService) SubmitLedgerChange(
 		SQLStatement:    req.SQLStatement,
 		BaseSequenceNum: latestSeq, // Use the latest sequence as base
 		Timestamp:       time.Now().UTC(),
-		SequenceNumber:  latestSeq + 1, // Increment by 1
+		// SequenceNumber will be determined by the repository in a transaction
 	}
 
-	// Add the change with the pre-assigned sequence number
+	// Let repository handle sequence number assignment with a transaction to prevent race conditions
 	if err := s.repo.AddLedgerChange(ctx, change); err != nil {
 		return nil, fmt.Errorf("error adding ledger change: %w", err)
 	}

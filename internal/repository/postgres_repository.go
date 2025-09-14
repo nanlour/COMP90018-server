@@ -106,6 +106,18 @@ func (r *PostgresRepository) GetUserByID(ctx context.Context, id string) (*model
 
 // Ledger repository methods
 func (r *PostgresRepository) CreateLedger(ctx context.Context, ledger *models.Ledger) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+	}()
+
 	query := `
 		INSERT INTO ledgers (id, name, description, currency, created_by, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -120,7 +132,7 @@ func (r *PostgresRepository) CreateLedger(ctx context.Context, ledger *models.Le
 	ledger.CreatedAt = now
 	ledger.UpdatedAt = now
 
-	_, err := r.db.ExecContext(ctx, query,
+	_, err = tx.ExecContext(ctx, query,
 		ledger.ID, ledger.Name, ledger.Description, ledger.Currency,
 		ledger.CreatedBy, ledger.CreatedAt, ledger.UpdatedAt)
 
@@ -136,7 +148,12 @@ func (r *PostgresRepository) CreateLedger(ctx context.Context, ledger *models.Le
 		CreatedAt:   now,
 	}
 
-	return r.AddUserToLedger(ctx, ledgerUser)
+	err = r.addUserToLedgerTx(ctx, tx, ledgerUser)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (r *PostgresRepository) DeleteLedger(ctx context.Context, ledgerID string) error {
@@ -206,7 +223,7 @@ func (r *PostgresRepository) GetUserLedgers(ctx context.Context, userID string) 
 
 // Ledger change repository methods
 func (r *PostgresRepository) AddLedgerChange(ctx context.Context, change *models.LedgerChange) error {
-	// Use a transaction to ensure atomicity when adding the change
+	// Start a regular transaction - no need for serializable since we're using a dedicated sequence table
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -219,20 +236,21 @@ func (r *PostgresRepository) AddLedgerChange(ctx context.Context, change *models
 		}
 	}()
 
-	// Get the current max sequence number for this ledger to verify our sequence is next
-	var currentSeq int64
+	// Get and increment the sequence number atomically
+	var nextSeq int64
 	err = tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(sequence_number), 0) FROM ledger_changes WHERE ledger_id = $1`,
-		change.LedgerID).Scan(&currentSeq)
-
+		`UPDATE ledger_sequences 
+		SET current_sequence = current_sequence + 1 
+		WHERE ledger_id = $1 
+		RETURNING current_sequence`,
+		change.LedgerID).Scan(&nextSeq)
 	if err != nil {
 		return err
 	}
 
-	// Verify that the sequence number is exactly one more than the current
-	if change.SequenceNumber != currentSeq+1 {
-		return errors.New("invalid sequence number")
-	} // Generate a new UUID if not provided
+	change.SequenceNumber = nextSeq
+
+	// Generate a new UUID if not provided
 	if change.ID == "" {
 		change.ID = uuid.New().String()
 	}
@@ -242,7 +260,7 @@ func (r *PostgresRepository) AddLedgerChange(ctx context.Context, change *models
 		change.Timestamp = time.Now().UTC()
 	}
 
-	// Insert the change
+	// Insert the change with the next sequence number
 	query := `
 		INSERT INTO ledger_changes (id, ledger_id, user_id, sequence_number, sql_statement, timestamp, base_sequence_number)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -290,11 +308,14 @@ func (r *PostgresRepository) GetLedgerChangesBySequenceRange(
 }
 
 func (r *PostgresRepository) GetLatestSequenceNumber(ctx context.Context, ledgerID string) (int64, error) {
-	query := `SELECT COALESCE(MAX(sequence_number), 0) FROM ledger_changes WHERE ledger_id = $1`
+	query := `SELECT current_sequence FROM ledger_sequences WHERE ledger_id = $1`
 
 	var seqNum int64
 	err := r.db.GetContext(ctx, &seqNum, query, ledgerID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil // Return 0 if no sequence exists yet
+		}
 		return 0, err
 	}
 
@@ -302,12 +323,13 @@ func (r *PostgresRepository) GetLatestSequenceNumber(ctx context.Context, ledger
 }
 
 // Ledger sharing repository methods
-func (r *PostgresRepository) AddUserToLedger(ctx context.Context, ledgerUser *models.LedgerUser) error {
+// addUserToLedgerTx is a helper method that adds a user to a ledger within an existing transaction
+func (r *PostgresRepository) addUserToLedgerTx(ctx context.Context, tx *sql.Tx, ledgerUser *models.LedgerUser) error {
 	// Check if entry already exists
 	var exists bool
-	err := r.db.GetContext(ctx, &exists,
+	err := tx.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM ledger_users WHERE ledger_id = $1 AND user_id = $2)`,
-		ledgerUser.LedgerID, ledgerUser.UserID)
+		ledgerUser.LedgerID, ledgerUser.UserID).Scan(&exists)
 
 	if err != nil {
 		return err
@@ -316,7 +338,7 @@ func (r *PostgresRepository) AddUserToLedger(ctx context.Context, ledgerUser *mo
 	if exists {
 		// Update the permissions if the user is already added
 		query := `UPDATE ledger_users SET permissions = $1 WHERE ledger_id = $2 AND user_id = $3`
-		_, err = r.db.ExecContext(ctx, query,
+		_, err = tx.ExecContext(ctx, query,
 			ledgerUser.Permissions, ledgerUser.LedgerID, ledgerUser.UserID)
 	} else {
 		// Add the user to the ledger
@@ -326,11 +348,32 @@ func (r *PostgresRepository) AddUserToLedger(ctx context.Context, ledgerUser *mo
 			ledgerUser.CreatedAt = time.Now().UTC()
 		}
 
-		_, err = r.db.ExecContext(ctx, query,
+		_, err = tx.ExecContext(ctx, query,
 			ledgerUser.LedgerID, ledgerUser.UserID, ledgerUser.Permissions, ledgerUser.CreatedAt)
 	}
 
 	return err
+}
+
+func (r *PostgresRepository) AddUserToLedger(ctx context.Context, ledgerUser *models.LedgerUser) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+	}()
+
+	err = r.addUserToLedgerTx(ctx, tx, ledgerUser)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (r *PostgresRepository) CheckLedgerAccess(
