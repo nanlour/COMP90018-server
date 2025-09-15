@@ -30,6 +30,7 @@ go test -v ./internal/api/tests/auth_test.go
 go test -v ./internal/api/tests/ledger_test.go
 go test -v ./internal/api/tests/ledger_changes_test.go
 go test -v ./internal/api/tests/ledger_sharing_test.go
+go test -v ./internal/api/tests/ledger_concurrent_test.go
 
 # Check if tests passed
 if [ $? -eq 0 ]; then
